@@ -319,7 +319,22 @@ const LAT = 22.6236, LON = 76.7017;
 // ════════════════════════════════════════
 const SHEETS_URL = 'https://script.google.com/macros/s/AKfycbyH-85oFenETdTtorjxzWOpakzCWLURguiPCzaxlei7R1xYhTmLJtMJ327AisC4osk6/exec';
 
-let readings = JSON.parse(localStorage.getItem('ttd_v2') || '[]');
+let readings = JSON.parse(localStorage.getItem('ttd_v2') || '[]').map(r => {
+  // Sanitise any previously stored bad date/time formats on load
+  if (r.date && (r.date.includes('T') || r.date.includes('Z'))) {
+    try {
+      const d = new Date(r.date);
+      if (!isNaN(d)) r.date = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    } catch(e) {}
+  }
+  if (r.time && (r.time.includes('T') || r.time.includes('Z'))) {
+    try {
+      const d = new Date(r.time);
+      if (!isNaN(d)) r.time = d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    } catch(e) { r.time = '--'; }
+  }
+  return r;
+});
 let ambientTemp = null;
 let selTrackVal = 'T3';
 let detailTrack = 'T3';
@@ -402,22 +417,73 @@ function getLatest(track) {
   return [...arr].sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time))[0].temp;
 }
 
+function safeFormatDate(dateStr) {
+  // dateStr must be YYYY-MM-DD string. Never pass it directly into new Date()
+  // because JS interprets YYYY-MM-DD as UTC midnight, causing timezone shifts.
+  // We parse manually to avoid any epoch issues.
+  if (!dateStr || typeof dateStr !== 'string') return 'Unknown date';
+  const parts = dateStr.split('-');
+  if (parts.length !== 3) return dateStr;
+  const [y, m, d] = parts.map(Number);
+  if (isNaN(y) || isNaN(m) || isNaN(d) || y < 2000 || y > 2100) return dateStr;
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  // Calculate day-of-week without Date() to avoid timezone issues
+  const jsDate = new Date(y, m - 1, d); // local midnight — safe for display only
+  const dow = days[jsDate.getDay()];
+  return dow + ', ' + String(d).padStart(2,'0') + ' ' + (months[m-1] || '') + ' ' + y;
+}
+
+function safeFormatTime(timeStr) {
+  // Cleans up any accidental ISO timestamp — only keep HH:MM
+  if (!timeStr) return '--';
+  // If it looks like an ISO string e.g. "1899-12-30T03:52:50.000Z", extract HH:MM from IST
+  if (timeStr.includes('T') || timeStr.includes('Z')) {
+    // Convert to local time string and extract HH:MM
+    try {
+      const d = new Date(timeStr);
+      if (!isNaN(d)) return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    } catch(e) {}
+    return '--';
+  }
+  // Normal HH:MM string — return as-is
+  return timeStr.slice(0, 5);
+}
+
+function sanitiseReading(r) {
+  // Ensure date is always a clean YYYY-MM-DD string
+  if (r.date && (r.date.includes('T') || r.date.includes('Z'))) {
+    // It's a full ISO — extract date portion in local time
+    try {
+      const d = new Date(r.date);
+      if (!isNaN(d)) {
+        r.date = d.getFullYear() + '-' +
+          String(d.getMonth()+1).padStart(2,'0') + '-' +
+          String(d.getDate()).padStart(2,'0');
+      }
+    } catch(e) {}
+  }
+  // Ensure time is always HH:MM
+  r.time = safeFormatTime(r.time);
+  return r;
+}
+
 function renderDetailTable(track) {
   const c = document.getElementById('log-table-container');
-  const arr = readings.filter(r => r.track === track);
+  const arr = readings.filter(r => r.track === track).map(sanitiseReading);
   if (!arr.length) { c.innerHTML = '<div class="no-data-msg">No data for ' + track + ' yet.</div>'; return; }
   const byDate = {};
   arr.forEach(r => { (byDate[r.date] = byDate[r.date] || []).push(r); });
   const dates = Object.keys(byDate).sort((a, b) => b.localeCompare(a));
+  const today = new Date().toISOString().split('T')[0];
   let html = '';
   dates.forEach(date => {
     const rows = byDate[date].sort((a, b) => b.time.localeCompare(a.time));
-    const dl = new Date(date + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' });
+    const dl = safeFormatDate(date);
     html += '<div class="log-date-head">' + dl + '</div><table class="log"><thead><tr><th>Time</th><th>Surface</th><th>Ambient</th></tr></thead><tbody>';
     rows.forEach(r => {
-      const today = new Date().toISOString().split('T')[0];
       const amb = r.ambient != null ? r.ambient + '°C' : (r.date === today && ambientTemp != null ? ambientTemp + '°C' : '—');
-      html += '<tr><td>' + (r.time || '--') + '</td><td class="surf-temp">' + r.temp + '°C</td><td class="amb-temp">' + amb + '</td></tr>';
+      html += '<tr><td>' + r.time + '</td><td class="surf-temp">' + r.temp + '°C</td><td class="amb-temp">' + amb + '</td></tr>';
     });
     html += '</tbody></table>';
   });
@@ -426,7 +492,7 @@ function renderDetailTable(track) {
 
 function renderRecentLog() {
   const c = document.getElementById('recent-log');
-  const arr = [...readings].sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)).slice(0, 25);
+  const arr = [...readings].map(sanitiseReading).sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)).slice(0, 25);
   if (!arr.length) { c.innerHTML = '<div class="no-data-msg">No readings yet.</div>'; return; }
   let html = '<table class="log"><thead><tr><th>Track</th><th>Date</th><th>Time</th><th>Surface</th><th></th></tr></thead><tbody>';
   arr.forEach(r => {
