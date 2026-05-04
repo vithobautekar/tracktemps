@@ -644,6 +644,848 @@ async function addManual() {
 }
 
 /* PASTE */
+// Converts DD/MM/YY or DD/MM/YYYY → YYYY-MM-DD
+function parseDateDMY(d, m, y) {
+  if (y.length === 2) y = '20' + y;
+  return y + '-' + m.padStart(2, '0') + '-' + d.padStart(2, '0');
+}
+
+// Checks if a number looks like a surface temperature (20–80°C range for track surfaces)
+function isTemp(v) { return v >= 20 && v <= 80; }
+
+function parsePaste() {
+  const rawTxt = document.getElementById('paste-input').value;
+  const fallbackDate = document.getElementById('paste-date').value; // YYYY-MM-DD from date input
+  parsedReadings = [];
+
+  // ── STEP 1: Normalise the input ───────────────────────────────────────────
+  // Your data arrives as one long string with entries crammed together like:
+  //   "29/04/26 T3 9:12 48.3 48.429/04/26 T13 9:13 48.3..."
+  // The date pattern DD/MM/YY is the natural entry-point separator.
+  // Insert a newline before every date-like token so we can split cleanly.
+  let txt = rawTxt
+    .replace(/(\d{1,2}\/\d{1,2}\/\d{2,4})/g, '\n$1') // newline before each DD/MM/YY
+    .replace(/\bT(3|13)\b/gi, '\nT$1')                   // newline before each T3/T13
+    .trim();
+
+  // ── STEP 2: Tokenise into chunks ─────────────────────────────────────────
+  // Each chunk is now one entry: [date?] [T3|T13] [HH:MM] [temp1] [temp2?] ...
+  // We walk token by token, tracking current date and track context.
+
+  const tokens = txt.split(/[\s,→\-–|]+/).filter(Boolean);
+  let curDate = fallbackDate;  // active date context
+  let curTrack = null;
+  let curTime = null;
+  const entries = []; // { date, track, time, temps[] }
+  let i = 0;
+
+  while (i < tokens.length) {
+    const tok = tokens[i];
+
+    // Date token: DD/MM/YY or DD/MM/YYYY
+    const dateMatch = tok.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (dateMatch) {
+      curDate = parseDateDMY(dateMatch[1], dateMatch[2], dateMatch[3]);
+      i++; continue;
+    }
+
+    // Track token: T3 or T13
+    const trackMatch = tok.match(/^[Tt](3|13)$/);
+    if (trackMatch) {
+      // Save any pending entry before starting a new one
+      curTrack = 'T' + trackMatch[1];
+      curTime = null;
+      i++; continue;
+    }
+
+    // Time token: H:MM or HH:MM
+    const timeMatch = tok.match(/^(\d{1,2}):(\d{2})$/);
+    if (timeMatch) {
+      curTime = timeMatch[1].padStart(2,'0') + ':' + timeMatch[2];
+      i++; continue;
+    }
+
+    // Temperature token: a decimal number that looks like a track surface temp
+    const numMatch = tok.match(/^(\d{2,3}(\.\d+)?)$/);
+    if (numMatch) {
+      const v = parseFloat(numMatch[1]);
+      if (isTemp(v) && curTrack && curTime && curDate) {
+        // Find or create an entry for this track/date/time
+        const existing = entries.find(e =>
+          e.date === curDate && e.track === curTrack && e.time === curTime
+        );
+        if (existing) {
+          existing.temps.push(v);
+        } else {
+          entries.push({ date: curDate, track: curTrack, time: curTime, temps: [v] });
+        }
+      }
+      i++; continue;
+    }
+
+    i++; // skip unknown tokens
+  }
+
+  // ── STEP 3: Flatten entries → individual readings ─────────────────────────
+  entries.forEach(entry => {
+    const [hh, mm] = entry.time.split(':').map(Number);
+    entry.temps.forEach((temp, idx) => {
+      // Each reading in the same session gets its own minute offset
+      const adjMin = String((mm + idx) % 60).padStart(2,'0');
+      const adjTime = String(hh).padStart(2,'0') + ':' + adjMin;
+      parsedReadings.push({
+        id: uid(),
+        track: entry.track,
+        date: entry.date,
+        time: adjTime,
+        temp: parseFloat(temp.toFixed(1)),
+        ambient: null  // filled by enrichWithHistoricalAmbient on save
+      });
+    });
+  });
+
+  // ── STEP 4: Show result ───────────────────────────────────────────────────
+  if (!parsedReadings.length) {
+    document.getElementById('parse-out').textContent =
+      'Could not find readings. Expected format:\n' +
+      '29/04/26 T3 9:12 48.3 48.4\n' +
+      '29/04/26 T13 9:13 48.3 46.8\n\n' +
+      'Or all on one line — dates and tracks are auto-detected.';
+    return;
+  }
+
+  let out = 'Found ' + parsedReadings.length + ' reading(s) — historical ambients will be fetched on save:\n\n';
+  // Group by date for readable output
+  const byDate = {};
+  parsedReadings.forEach(r => { (byDate[r.date] = byDate[r.date] || []).push(r); });
+  Object.keys(byDate).sort().forEach(date => {
+    const label = date.split('-').slice(1).reverse().join('/') + '/' + date.split('-')[0].slice(2);
+    out += '📅 ' + label + '\n';
+    byDate[date].forEach(r => { out += '  ' + r.track + '  ' + r.time + '  →  ' + r.temp + '°C\n'; });
+    out += '\n';
+  });
+  document.getElementById('parse-out').textContent = out.trim();
+}
+
+async function applyParsed() {
+  if (!parsedReadings.length) { toast('Parse data first'); return; }
+  const btn = document.querySelector('#panel-paste .btn-primary');
+  if (btn) { btn.textContent = 'Fetching historical ambients...'; btn.disabled = true; }
+  // Auto-fetch correct historical ambient for every parsed reading
+  await enrichWithHistoricalAmbient(parsedReadings);
+  readings.push(...parsedReadings);
+  const n = parsedReadings.length;
+  parsedReadings = [];
+  save();
+  if (btn) { btn.textContent = '✓ Save all extracted readings'; btn.disabled = false; }
+  document.getElementById('parse-out').textContent = '✓ Saved with historical ambient temps!';
+  document.getElementById('paste-input').value = '';
+  toast(n + ' reading' + (n !== 1 ? 's' : '') + ' saved with correct ambients');
+  syncAllToSheets();
+  renderHome();
+  renderRecentLog();
+}
+function handleImg(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const img = document.getElementById('imgPreview');
+    img.src = ev.target.result;
+    img.style.display = 'block';
+    toast('Photo loaded — read values and enter above');
+  };
+  reader.readAsDataURL(file);
+}
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach((b, i) => b.classList.toggle('active', (i === 0 && name === 'manual') || (i === 1 && name === 'paste')));
+  document.getElementById('panel-manual').classList.toggle('active', name === 'manual');
+  document.getElementById('panel-paste').classList.toggle('active', name === 'paste');
+}
+
+// ── GOOGLE SHEETS SYNC ──
+async function syncToSheets(row) {
+  if (!SHEETS_URL) return;
+  try {
+    await fetch(SHEETS_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'append', row })
+    });
+  } catch(e) { console.warn('Sheets sync failed', e); }
+}
+
+async function syncAllToSheets() {
+  if (!SHEETS_URL) return;
+  try {
+    await fetch(SHEETS_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'sync_all', readings })
+    });
+    toast('Synced to Google Sheets ✓');
+  } catch(e) { console.warn('Sheets full sync failed', e); }
+}
+
+async function loadFromSheets() {
+  if (!SHEETS_URL) return false;
+  try {
+    const r = await fetch(SHEETS_URL + '?action=read');
+    const d = await r.json();
+    if (d && d.readings && d.readings.length > 0) {
+      readings = d.readings;
+      save();
+      renderHome();
+      renderRecentLog();
+      return true;
+    }
+  } catch(e) { console.warn('Sheets load failed, using local data', e); }
+  return false;
+}
+
+function uid() { return Math.random().toString(36).slice(2, 10); }
+function save() { localStorage.setItem('ttd_v2', JSON.stringify(readings)); }
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+function seedData() {
+  // Historical ambient temps fetched from weather records for NATRAX Pithampur:
+  // 03-May-2026 05:01 IST → ~28.5°C (pre-dawn, daily low ~28°C for May 3)
+  // 04-May-2026 09:09 IST → ~32.0°C (mid-morning warm-up, daily avg ~32°C for May 4)
+  readings = [
+    { id: uid(), track: 'T3',  date: '2026-05-03', time: '05:01', temp: 51.7, ambient: 28.5 },
+    { id: uid(), track: 'T3',  date: '2026-05-03', time: '05:01', temp: 51.7, ambient: 28.5 },
+    { id: uid(), track: 'T3',  date: '2026-05-03', time: '05:02', temp: 51.5, ambient: 28.5 },
+    { id: uid(), track: 'T13', date: '2026-05-03', time: '05:04', temp: 53.0, ambient: 28.6 },
+    { id: uid(), track: 'T13', date: '2026-05-03', time: '05:04', temp: 52.9, ambient: 28.6 },
+    { id: uid(), track: 'T13', date: '2026-05-03', time: '05:04', temp: 52.9, ambient: 28.6 },
+    { id: uid(), track: 'T13', date: '2026-05-04', time: '09:09', temp: 46.6, ambient: 32.0 },
+    { id: uid(), track: 'T13', date: '2026-05-04', time: '09:09', temp: 46.5, ambient: 32.0 },
+    { id: uid(), track: 'T13', date: '2026-05-04', time: '09:10', temp: 45.9, ambient: 32.1 },
+    { id: uid(), track: 'T3',  date: '2026-05-04', time: '09:13', temp: 42.7, ambient: 32.2 },
+    { id: uid(), track: 'T3',  date: '2026-05-04', time: '09:14', temp: 43.3, ambient: 32.2 },
+    { id: uid(), track: 'T3',  date: '2026-05-04', time: '09:14', temp: 42.4, ambient: 32.2 },
+  ];
+  save();
+  if (SHEETS_URL) syncAllToSheets();
+}
+</script>
+</body>
+</html>  .page.active { display: block; }
+
+  .track-card { background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; margin-bottom: 1rem; cursor: pointer; transition: transform 0.15s; }
+  .track-card:active { transform: scale(0.98); }
+  .track-card-head { padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; }
+  .track-card-head.t3 { background: var(--t3); color: #fff; }
+  .track-card-head.t13 { background: var(--t13); color: #fff; }
+  .track-name { font-size: 15px; font-weight: 600; }
+  .track-stat-row { display: grid; grid-template-columns: 1fr 1fr; }
+  .track-stat { padding: 14px 16px; }
+  .track-stat:first-child { border-right: 1px solid var(--border); }
+  .stat-label { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 5px; margin-bottom: 4px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+  .dot.surf { background: #e67e22; }
+  .dot.amb { background: #2ecc71; }
+  .stat-val { font-size: 24px; font-weight: 600; line-height: 1; }
+  .stat-val.empty { font-size: 16px; color: #bbb; font-weight: 400; }
+  .stat-val sup { font-size: 13px; font-weight: 400; color: var(--muted); }
+  .track-footer { background: #fafaf8; border-top: 1px solid var(--border); padding: 8px 16px; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+
+  .back-btn { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); margin-bottom: 1rem; cursor: pointer; background: none; border: none; padding: 0; }
+  .detail-header { border-radius: var(--radius); padding: 14px 16px; color: #fff; margin-bottom: 1rem; }
+  .detail-header.t3 { background: var(--t3); }
+  .detail-header.t13 { background: var(--t13); }
+  .detail-title { font-size: 20px; font-weight: 700; }
+  .detail-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .detail-stat { background: rgba(255,255,255,0.15); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .detail-stat .dl { font-size: 10px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.05em; }
+  .detail-stat .dv { font-size: 22px; font-weight: 600; margin-top: 2px; }
+
+  .section-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 1.25rem 0 0.6rem; }
+  .log-table-wrap { background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; margin-bottom: 1rem; }
+  .log-date-head { background: #f0f0ec; padding: 7px 14px; font-size: 11px; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--border); }
+  table.log { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.log th { background: #f8f8f5; padding: 8px 10px; text-align: left; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; border-bottom: 1px solid var(--border); }
+  table.log td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  table.log tr:last-child td { border-bottom: none; }
+  .surf-temp { font-weight: 600; color: #c0392b; }
+  .amb-temp { font-weight: 600; color: #1a6faf; }
+  .no-data-msg { padding: 1.5rem; text-align: center; color: var(--muted); font-size: 13px; }
+  .del-btn { background: none; border: none; color: #ccc; font-size: 16px; cursor: pointer; padding: 0 4px; }
+  .del-btn:active { color: #c0392b; }
+
+  /* ── LOGIN ── */
+  .login-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 60vh; padding: 2rem 1.5rem; }
+  .login-card { background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); padding: 2rem 1.5rem; width: 100%; max-width: 340px; }
+  .lock-icon { text-align: center; font-size: 40px; margin-bottom: 1rem; }
+  .login-card h2 { font-size: 16px; font-weight: 600; text-align: center; margin-bottom: 0.3rem; }
+  .login-card p { font-size: 12px; color: var(--muted); text-align: center; margin-bottom: 1.25rem; }
+  .login-card input[type=password] { width: 100%; padding: 11px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 16px; background: #fafaf8; color: var(--text); margin-bottom: 10px; letter-spacing: 0.1em; }
+  .login-card input[type=password]:focus { outline: 2px solid var(--header-bg); border-color: transparent; }
+  .login-submit { width: 100%; padding: 11px; background: var(--header-bg); color: #fff; border: none; border-radius: var(--radius-sm); font-size: 14px; font-weight: 600; cursor: pointer; }
+  .login-error { color: #c0392b; font-size: 12px; text-align: center; margin-top: 8px; min-height: 18px; }
+  .logout-btn { font-size: 11px; color: var(--muted); background: none; border: none; cursor: pointer; text-decoration: underline; }
+
+  /* ── ADMIN FORMS ── */
+  .admin-card { background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); padding: 1rem; margin-bottom: 1rem; }
+  .admin-card h3 { font-size: 14px; font-weight: 600; margin-bottom: 0.75rem; }
+  .tab-row { display: flex; gap: 6px; margin-bottom: 1rem; }
+  .tab-btn { flex: 1; padding: 8px 6px; font-size: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--muted); cursor: pointer; text-align: center; }
+  .tab-btn.active { background: var(--header-bg); color: #fff; border-color: var(--header-bg); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .form-group { margin-bottom: 0.75rem; }
+  .form-group label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .form-group input, .form-group textarea { width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 14px; background: #fafaf8; color: var(--text); }
+  .form-group textarea { height: 110px; resize: none; font-size: 13px; line-height: 1.5; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .btn-primary { background: var(--header-bg); color: #fff; border: none; border-radius: var(--radius-sm); padding: 11px 16px; font-size: 14px; cursor: pointer; width: 100%; margin-top: 4px; font-weight: 500; }
+  .btn-secondary { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 9px 16px; font-size: 13px; cursor: pointer; width: 100%; margin-bottom: 8px; }
+  .parse-out { background: #f0f8ff; border: 1px solid #cce0f5; border-radius: var(--radius-sm); padding: 10px 12px; font-size: 12px; min-height: 44px; color: var(--text); margin-bottom: 8px; white-space: pre-line; line-height: 1.7; }
+  .track-select-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 0.75rem; }
+  .track-sel-btn { padding: 10px; border: 2px solid var(--border); border-radius: var(--radius-sm); text-align: center; font-size: 15px; font-weight: 700; cursor: pointer; background: var(--bg); color: var(--muted); }
+  .track-sel-btn.sel-t3.active { background: #fdf0ef; border-color: var(--t3); color: var(--t3); }
+  .track-sel-btn.sel-t13.active { background: #eef5fc; border-color: var(--t13); color: var(--t13); }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+  .img-upload-area { border: 2px dashed var(--border); border-radius: var(--radius-sm); padding: 1.25rem; text-align: center; color: var(--muted); font-size: 13px; cursor: pointer; background: #fafaf8; }
+  .img-preview { width: 100%; border-radius: var(--radius-sm); margin-top: 8px; display: none; }
+
+  .legend { display: flex; gap: 14px; margin-bottom: 1rem; }
+  .legend-item { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+  .ad-slot { background: #f0f0ec; border-radius: var(--radius); border: 1.5px dashed #ccc; height: 60px; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #aaa; margin-top: 0.5rem; }
+
+  .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; background: var(--card); border-top: 1px solid var(--border); display: flex; z-index: 200; }
+  .nav-btn { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 10px 0 12px; font-size: 10px; color: var(--muted); cursor: pointer; border: none; background: none; gap: 4px; }
+  .nav-btn svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .nav-btn.active { color: var(--header-bg); }
+
+  .toast { position: fixed; bottom: 70px; left: 50%; transform: translateX(-50%); background: #1a1a2e; color: #fff; padding: 9px 20px; border-radius: 20px; font-size: 13px; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 999; white-space: nowrap; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-top">
+    <div>
+      <h1>Track Temperature Dashboard</h1>
+      <div class="sub">NATRAX — National Automotive Test Tracks, Pithampur</div>
+    </div>
+    <div class="live-badge"><span class="live-dot"></span> Live</div>
+  </div>
+  <div class="ambient-strip">
+    <div class="amb-card">
+      <div class="amb-label">T3 — Ambient</div>
+      <div class="amb-val" id="hdr-t3-amb">--°C</div>
+      <div class="amb-time" id="hdr-t3-time">fetching...</div>
+    </div>
+    <div class="amb-card">
+      <div class="amb-label">T13 — Ambient</div>
+      <div class="amb-val" id="hdr-t13-amb">--°C</div>
+      <div class="amb-time" id="hdr-t13-time">fetching...</div>
+    </div>
+  </div>
+</div>
+
+<!-- HOME -->
+<div class="page active" id="page-home">
+  <div class="legend">
+    <div class="legend-item"><span class="dot surf"></span> Surface temp</div>
+    <div class="legend-item"><span class="dot amb"></span> Ambient temp</div>
+  </div>
+  <div class="track-card" onclick="openDetail('T3')">
+    <div class="track-card-head t3"><span class="track-name">Track T3</span><span>›</span></div>
+    <div class="track-stat-row">
+      <div class="track-stat">
+        <div class="stat-label"><span class="dot surf"></span> Latest surface</div>
+        <div class="stat-val empty" id="home-t3-surf">—</div>
+      </div>
+      <div class="track-stat">
+        <div class="stat-label"><span class="dot amb"></span> Ambient now</div>
+        <div class="stat-val" id="home-t3-amb">--<sup>°C</sup></div>
+      </div>
+    </div>
+    <div class="track-footer"><span id="home-t3-count">No readings yet</span><span>Tap to see log →</span></div>
+  </div>
+  <div class="track-card" onclick="openDetail('T13')">
+    <div class="track-card-head t13"><span class="track-name">Track T13</span><span>›</span></div>
+    <div class="track-stat-row">
+      <div class="track-stat">
+        <div class="stat-label"><span class="dot surf"></span> Latest surface</div>
+        <div class="stat-val empty" id="home-t13-surf">—</div>
+      </div>
+      <div class="track-stat">
+        <div class="stat-label"><span class="dot amb"></span> Ambient now</div>
+        <div class="stat-val" id="home-t13-amb">--<sup>°C</sup></div>
+      </div>
+    </div>
+    <div class="track-footer"><span id="home-t13-count">No readings yet</span><span>Tap to see log →</span></div>
+  </div>
+  <div class="ad-slot">[ Google AdSense — 320×50 banner ]</div>
+</div>
+
+<!-- DETAIL -->
+<div class="page" id="page-detail">
+  <button class="back-btn" onclick="showPage('home')">‹ Back to Dashboard</button>
+  <div class="detail-header" id="detail-header">
+    <div class="detail-title" id="detail-title">Track T3</div>
+    <div class="detail-stats">
+      <div class="detail-stat"><div class="dl">Latest surface</div><div class="dv" id="detail-surf">--°C</div></div>
+      <div class="detail-stat"><div class="dl">Ambient now</div><div class="dv" id="detail-amb">--°C</div></div>
+    </div>
+  </div>
+  <div class="section-title">Full Temperature Log</div>
+  <div class="log-table-wrap" id="log-table-container"><div class="no-data-msg">No data yet.</div></div>
+</div>
+
+<!-- ADMIN -->
+<div class="page" id="page-admin">
+
+  <!-- LOGIN -->
+  <div class="login-screen" id="login-screen">
+    <div class="login-card">
+      <div class="lock-icon">🔒</div>
+      <h2>Admin Access</h2>
+      <p>Enter your password to update temperature data</p>
+      <input type="password" id="pwd-input" placeholder="Password" onkeydown="if(event.key==='Enter')doLogin()">
+      <button class="login-submit" onclick="doLogin()">Sign in</button>
+      <div class="login-error" id="login-error"></div>
+    </div>
+  </div>
+
+  <!-- PANEL -->
+  <div id="admin-panel" style="display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+      <div style="font-size:13px;font-weight:600;color:var(--muted);">Admin Panel</div>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <button class="logout-btn" onclick="syncAllToSheets()" style="color:#1a6faf;">⟳ Sync Sheets</button>
+        <button class="logout-btn" onclick="doLogout()">Sign out</button>
+      </div>
+    </div>
+
+    <div class="admin-card">
+      <div class="tab-row">
+        <div class="tab-btn active" onclick="switchTab('manual')">Manual entry</div>
+        <div class="tab-btn" onclick="switchTab('paste')">Paste / sheet data</div>
+      </div>
+
+      <div class="tab-panel active" id="panel-manual">
+        <div class="form-group">
+          <label>Select Track</label>
+          <div class="track-select-row">
+            <div class="track-sel-btn sel-t3 active" id="sel-t3" onclick="selTrack('T3')">T3</div>
+            <div class="track-sel-btn sel-t13" id="sel-t13" onclick="selTrack('T13')">T13</div>
+          </div>
+        </div>
+        <div class="row2">
+          <div class="form-group"><label>Date</label><input type="date" id="man-date"></div>
+          <div class="form-group"><label>Time</label><input type="time" id="man-time"></div>
+        </div>
+        <div class="form-group">
+          <label>Surface Temperature (°C)</label>
+          <input type="number" id="man-temp" placeholder="e.g. 51.7" step="0.1">
+        </div>
+        <button class="btn-primary" onclick="addManual()">+ Add Reading</button>
+        <div class="hint">Add multiple readings one by one for the same session.</div>
+      </div>
+
+      <div class="tab-panel" id="panel-paste">
+        <div class="form-group">
+          <label>Paste WhatsApp message or data from sheet</label>
+          <textarea id="paste-input" placeholder="Examples:
+T3 9:13 42.7 43.3 42.4
+T13 at 9:09 → 46.6, 46.5, 45.9
+03/05/26 T3 5:01 51.7 51.7 51.5
+T13 5:04 53.0 52.9 52.9"></textarea>
+        </div>
+        <div class="form-group">
+          <label>Date for this batch (if not in the text)</label>
+          <input type="date" id="paste-date">
+        </div>
+        <button class="btn-secondary" onclick="parsePaste()">🔍 Extract readings from text</button>
+        <div class="parse-out" id="parse-out">Extracted readings will appear here...</div>
+        <button class="btn-primary" onclick="applyParsed()">✓ Save all extracted readings</button>
+
+        <div style="margin-top:1rem;border-top:1px solid var(--border);padding-top:1rem;">
+          <div style="font-size:13px;font-weight:600;margin-bottom:8px;">Upload photo of data sheet</div>
+          <div class="img-upload-area" onclick="document.getElementById('imgInput').click()">
+            <input type="file" id="imgInput" accept="image/*" onchange="handleImg(event)" style="display:none">
+            📷 Tap to open sheet photo<br>
+            <span style="font-size:11px;opacity:0.6;">View then type values above</span>
+          </div>
+          <img id="imgPreview" class="img-preview" alt="Sheet preview">
+        </div>
+      </div>
+    </div>
+
+    <div class="section-title">Recent Readings (tap ✕ to delete)</div>
+    <div class="log-table-wrap" id="recent-log"><div class="no-data-msg">No readings yet.</div></div>
+  </div>
+</div>
+
+<!-- NAV -->
+<div class="bottom-nav">
+  <button class="nav-btn active" id="nav-home" onclick="showPage('home')">
+    <svg viewBox="0 0 24 24"><path d="M3 9.5L12 3l9 6.5V20a1 1 0 01-1 1H4a1 1 0 01-1-1V9.5z"/><polyline points="9 21 9 12 15 12 15 21"/></svg>
+    Dashboard
+  </button>
+  <button class="nav-btn" id="nav-admin" onclick="showPage('admin')">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/><circle cx="19" cy="19" r="3"/><line x1="19" y1="17" x2="19" y2="21"/><line x1="17" y1="19" x2="21" y2="19"/></svg>
+    Admin
+  </button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ════════════════════════════════════════
+// CHANGE YOUR PASSWORD HERE — open this
+// file in Notepad and replace the text
+// between the quotes below.
+// ════════════════════════════════════════
+const ADMIN_PASSWORD = 'natrax2026';
+
+// NATRAX Pithampur, Madhya Pradesh
+const LAT = 22.6236, LON = 76.7017;
+
+// ════════════════════════════════════════
+// GOOGLE SHEETS SETUP
+// Paste your Apps Script Web App URL here
+// after following the setup guide below.
+// Leave empty ('') to use local storage only.
+// ════════════════════════════════════════
+const SHEETS_URL = 'https://script.google.com/macros/s/AKfycbyH-85oFenETdTtorjxzWOpakzCWLURguiPCzaxlei7R1xYhTmLJtMJ327AisC4osk6/exec';
+
+let readings = JSON.parse(localStorage.getItem('ttd_v2') || '[]').map(r => {
+  // Sanitise any previously stored bad date/time formats on load
+  if (r.date && (r.date.includes('T') || r.date.includes('Z'))) {
+    try {
+      const d = new Date(r.date);
+      if (!isNaN(d)) r.date = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    } catch(e) {}
+  }
+  if (r.time && (r.time.includes('T') || r.time.includes('Z'))) {
+    try {
+      const d = new Date(r.time);
+      if (!isNaN(d)) r.time = d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    } catch(e) { r.time = '--'; }
+  }
+  return r;
+});
+let ambientTemp = null;
+let selTrackVal = 'T3';
+let detailTrack = 'T3';
+let parsedReadings = [];
+let loggedIn = sessionStorage.getItem('ttd_auth') === '1';
+
+document.addEventListener('DOMContentLoaded', () => {
+  const now = new Date();
+  const today = now.toISOString().split('T')[0];
+  document.getElementById('man-date').value = today;
+  document.getElementById('paste-date').value = today;
+  document.getElementById('man-time').value = now.toTimeString().slice(0, 5);
+  fetchAmbient();
+  setInterval(fetchAmbient, 10 * 60 * 1000);
+  loadFromSheets().then(loaded => {
+    if (!loaded && readings.length === 0) seedData();
+    renderHome();
+    renderRecentLog();
+    if (loggedIn) revealPanel();
+  });
+});
+
+async function fetchAmbient() {
+  try {
+    const r = await fetch('https://api.open-meteo.com/v1/forecast?latitude=' + LAT + '&longitude=' + LON + '&current=temperature_2m&timezone=Asia/Kolkata');
+    const d = await r.json();
+    ambientTemp = parseFloat(d.current.temperature_2m.toFixed(1));
+    const t = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+    ['t3', 't13'].forEach(id => {
+      document.getElementById('hdr-' + id + '-amb').textContent = ambientTemp + '°C';
+      document.getElementById('hdr-' + id + '-time').textContent = 'as of ' + t;
+      document.getElementById('home-' + id + '-amb').innerHTML = ambientTemp + '<sup>°C</sup>';
+    });
+    const da = document.getElementById('detail-amb');
+    if (da) da.textContent = ambientTemp + '°C';
+  } catch (e) { console.warn('Weather unavailable'); }
+}
+
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  const nb = document.getElementById('nav-' + name);
+  if (nb) nb.classList.add('active');
+  window.scrollTo(0, 0);
+}
+
+function openDetail(track) {
+  detailTrack = track;
+  document.getElementById('detail-header').className = 'detail-header ' + track.toLowerCase();
+  document.getElementById('detail-title').textContent = 'Track ' + track;
+  const latest = getLatest(track);
+  document.getElementById('detail-surf').textContent = latest !== null ? latest + '°C' : '--°C';
+  document.getElementById('detail-amb').textContent = ambientTemp !== null ? ambientTemp + '°C' : '--°C';
+  renderDetailTable(track);
+  showPage('detail');
+}
+
+function renderHome() {
+  ['T3', 'T13'].forEach(track => {
+    const id = track.toLowerCase();
+    const latest = getLatest(track);
+    const count = readings.filter(r => r.track === track).length;
+    const el = document.getElementById('home-' + id + '-surf');
+    if (latest !== null) {
+      el.className = 'stat-val';
+      el.innerHTML = latest + '<sup>°C</sup>';
+    } else {
+      el.className = 'stat-val empty';
+      el.textContent = '—';
+    }
+    document.getElementById('home-' + id + '-count').textContent =
+      count > 0 ? count + ' reading' + (count !== 1 ? 's' : '') + ' logged' : 'No readings yet';
+  });
+}
+
+function getLatest(track) {
+  const arr = readings.filter(r => r.track === track);
+  if (!arr.length) return null;
+  return [...arr].sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time))[0].temp;
+}
+
+function safeFormatDate(dateStr) {
+  // dateStr must be YYYY-MM-DD string. Never pass it directly into new Date()
+  // because JS interprets YYYY-MM-DD as UTC midnight, causing timezone shifts.
+  // We parse manually to avoid any epoch issues.
+  if (!dateStr || typeof dateStr !== 'string') return 'Unknown date';
+  const parts = dateStr.split('-');
+  if (parts.length !== 3) return dateStr;
+  const [y, m, d] = parts.map(Number);
+  if (isNaN(y) || isNaN(m) || isNaN(d) || y < 2000 || y > 2100) return dateStr;
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  // Calculate day-of-week without Date() to avoid timezone issues
+  const jsDate = new Date(y, m - 1, d); // local midnight — safe for display only
+  const dow = days[jsDate.getDay()];
+  return dow + ', ' + String(d).padStart(2,'0') + ' ' + (months[m-1] || '') + ' ' + y;
+}
+
+function safeFormatTime(timeStr) {
+  // Cleans up any accidental ISO timestamp — only keep HH:MM
+  if (!timeStr) return '--';
+  // If it looks like an ISO string e.g. "1899-12-30T03:52:50.000Z", extract HH:MM from IST
+  if (timeStr.includes('T') || timeStr.includes('Z')) {
+    // Convert to local time string and extract HH:MM
+    try {
+      const d = new Date(timeStr);
+      if (!isNaN(d)) return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    } catch(e) {}
+    return '--';
+  }
+  // Normal HH:MM string — return as-is
+  return timeStr.slice(0, 5);
+}
+
+function sanitiseReading(r) {
+  // Ensure date is always a clean YYYY-MM-DD string
+  if (r.date && (r.date.includes('T') || r.date.includes('Z'))) {
+    // It's a full ISO — extract date portion in local time
+    try {
+      const d = new Date(r.date);
+      if (!isNaN(d)) {
+        r.date = d.getFullYear() + '-' +
+          String(d.getMonth()+1).padStart(2,'0') + '-' +
+          String(d.getDate()).padStart(2,'0');
+      }
+    } catch(e) {}
+  }
+  // Ensure time is always HH:MM
+  r.time = safeFormatTime(r.time);
+  return r;
+}
+
+function renderDetailTable(track) {
+  const c = document.getElementById('log-table-container');
+  const arr = readings.filter(r => r.track === track).map(sanitiseReading);
+  if (!arr.length) { c.innerHTML = '<div class="no-data-msg">No data for ' + track + ' yet.</div>'; return; }
+  const byDate = {};
+  arr.forEach(r => { (byDate[r.date] = byDate[r.date] || []).push(r); });
+  const dates = Object.keys(byDate).sort((a, b) => b.localeCompare(a));
+  const today = new Date().toISOString().split('T')[0];
+  let html = '';
+  dates.forEach(date => {
+    const rows = byDate[date].sort((a, b) => b.time.localeCompare(a.time));
+    const dl = safeFormatDate(date);
+    html += '<div class="log-date-head">' + dl + '</div><table class="log"><thead><tr><th>Time</th><th>Surface</th><th>Ambient</th></tr></thead><tbody>';
+    rows.forEach(r => {
+      const amb = r.ambient != null ? r.ambient + '°C' : (r.date === today && ambientTemp != null ? ambientTemp + '°C' : '—');
+      html += '<tr><td>' + r.time + '</td><td class="surf-temp">' + r.temp + '°C</td><td class="amb-temp">' + amb + '</td></tr>';
+    });
+    html += '</tbody></table>';
+  });
+  c.innerHTML = html;
+}
+
+function renderRecentLog() {
+  const c = document.getElementById('recent-log');
+  const arr = [...readings].map(sanitiseReading).sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)).slice(0, 25);
+  if (!arr.length) { c.innerHTML = '<div class="no-data-msg">No readings yet.</div>'; return; }
+  let html = '<table class="log"><thead><tr><th>Track</th><th>Date</th><th>Time</th><th>Surface</th><th></th></tr></thead><tbody>';
+  arr.forEach(r => {
+    const col = r.track === 'T3' ? 'var(--t3)' : 'var(--t13)';
+    const ds = r.date ? r.date.split('-').slice(1).reverse().join('/') : '--';
+    html += '<tr><td style="font-weight:700;color:' + col + '">' + r.track + '</td><td style="font-size:12px">' + ds + '</td><td>' + (r.time || '--') + '</td><td class="surf-temp">' + r.temp + '°C</td><td><button class="del-btn" onclick="delReading(\'' + r.id + '\')">✕</button></td></tr>';
+  });
+  html += '</tbody></table>';
+  c.innerHTML = html;
+}
+
+function delReading(id) {
+  readings = readings.filter(r => r.id !== id);
+  save();
+  renderHome();
+  renderRecentLog();
+  if (document.getElementById('page-detail').classList.contains('active')) renderDetailTable(detailTrack);
+  toast('Reading deleted');
+}
+
+/* AUTH */
+function doLogin() {
+  const val = document.getElementById('pwd-input').value;
+  if (val === ADMIN_PASSWORD) {
+    loggedIn = true;
+    sessionStorage.setItem('ttd_auth', '1');
+    document.getElementById('login-error').textContent = '';
+    document.getElementById('pwd-input').value = '';
+    revealPanel();
+  } else {
+    document.getElementById('login-error').textContent = 'Incorrect password. Try again.';
+    document.getElementById('pwd-input').value = '';
+  }
+}
+function doLogout() {
+  loggedIn = false;
+  sessionStorage.removeItem('ttd_auth');
+  document.getElementById('admin-panel').style.display = 'none';
+  document.getElementById('login-screen').style.display = 'flex';
+  showPage('home');
+  toast('Signed out');
+}
+function revealPanel() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('admin-panel').style.display = 'block';
+  renderRecentLog();
+}
+
+// ── HISTORICAL AMBIENT FETCH ──────────────────────────────────
+// Uses Open-Meteo historical API (free, no key needed).
+// Fetches the actual hourly temperature at NATRAX for any past date/time.
+// Returns null if the date is today or in the future (use live temp instead).
+async function fetchHistoricalAmbient(date, time) {
+  const today = new Date().toISOString().split('T')[0];
+  if (date >= today) return null; // today or future → use live ambient
+
+  try {
+    const hour = parseInt((time || '00:00').split(':')[0]);
+    const url = 'https://api.open-meteo.com/v1/history' +
+      '?latitude=' + LAT +
+      '&longitude=' + LON +
+      '&start_date=' + date +
+      '&end_date=' + date +
+      '&hourly=temperature_2m' +
+      '&timezone=Asia%2FKolkata';
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data && data.hourly && data.hourly.temperature_2m) {
+      // Each index = one hour (0=midnight, 5=5AM, 9=9AM, etc.)
+      const temp = data.hourly.temperature_2m[hour];
+      return temp !== undefined && temp !== null ? parseFloat(temp.toFixed(1)) : null;
+    }
+  } catch(e) {
+    console.warn('Historical ambient fetch failed for ' + date + ' ' + time, e);
+  }
+  return null;
+}
+
+// Fetch historical ambient for a group of readings sharing the same date,
+// then assign the correct hourly value to each based on its time.
+async function enrichWithHistoricalAmbient(rows) {
+  // Group by date so we only call the API once per unique date
+  const byDate = {};
+  rows.forEach(r => { (byDate[r.date] = byDate[r.date] || []).push(r); });
+
+  const today = new Date().toISOString().split('T')[0];
+
+  for (const date of Object.keys(byDate)) {
+    if (date >= today) {
+      // Today or future — use live ambient
+      byDate[date].forEach(r => { if (r.ambient == null) r.ambient = ambientTemp; });
+      continue;
+    }
+    try {
+      const url = 'https://api.open-meteo.com/v1/history' +
+        '?latitude=' + LAT +
+        '&longitude=' + LON +
+        '&start_date=' + date +
+        '&end_date=' + date +
+        '&hourly=temperature_2m' +
+        '&timezone=Asia%2FKolkata';
+      const res = await fetch(url);
+      const data = await res.json();
+      const hourlyTemps = (data && data.hourly && data.hourly.temperature_2m) || [];
+      byDate[date].forEach(r => {
+        const hour = parseInt((r.time || '00:00').split(':')[0]);
+        const hist = hourlyTemps[hour];
+        r.ambient = (hist !== undefined && hist !== null) ? parseFloat(hist.toFixed(1)) : null;
+      });
+    } catch(e) {
+      console.warn('Historical fetch failed for ' + date, e);
+      byDate[date].forEach(r => { if (r.ambient == null) r.ambient = null; });
+    }
+  }
+  return rows;
+}
+
+/* MANUAL */
+function selTrack(t) {
+  selTrackVal = t;
+  document.getElementById('sel-t3').classList.toggle('active', t === 'T3');
+  document.getElementById('sel-t13').classList.toggle('active', t === 'T13');
+}
+
+async function addManual() {
+  const date = document.getElementById('man-date').value;
+  const time = document.getElementById('man-time').value || new Date().toTimeString().slice(0, 5);
+  const temp = parseFloat(document.getElementById('man-temp').value);
+  if (!date || isNaN(temp)) { toast('Fill in date and temperature'); return; }
+
+  const today = new Date().toISOString().split('T')[0];
+  let amb = ambientTemp; // default: live ambient (for today)
+
+  if (date < today) {
+    toast('Fetching historical ambient for ' + date + '...');
+    amb = await fetchHistoricalAmbient(date, time);
+  }
+
+  const newRow = { id: uid(), track: selTrackVal, date, time, temp: parseFloat(temp.toFixed(1)), ambient: amb };
+  readings.push(newRow);
+  save();
+  syncToSheets(newRow);
+  document.getElementById('man-temp').value = '';
+  document.getElementById('man-time').value = new Date().toTimeString().slice(0, 5);
+  const ambLabel = amb !== null ? ' (ambient: ' + amb + '°C)' : '';
+  toast('Added for ' + selTrackVal + ambLabel);
+  renderHome();
+  renderRecentLog();
+}
+
+/* PASTE */
 function parsePaste() {
   const txt = document.getElementById('paste-input').value;
   const dateVal = document.getElementById('paste-date').value;
