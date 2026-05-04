@@ -545,26 +545,61 @@ function revealPanel() {
 // Uses Open-Meteo historical API (free, no key needed).
 // Fetches the actual hourly temperature at NATRAX for any past date/time.
 // Returns null if the date is today or in the future (use live temp instead).
+// Returns how many days ago a YYYY-MM-DD date is from today
+function daysAgo(dateStr) {
+  const now = new Date();
+  const then = new Date(dateStr + 'T00:00:00');
+  return Math.floor((now - then) / (1000 * 60 * 60 * 24));
+}
+
 async function fetchHistoricalAmbient(date, time) {
   const today = new Date().toISOString().split('T')[0];
   if (date >= today) return null; // today or future → use live ambient
 
+  const hour = parseInt((time || '00:00').split(':')[0]);
+  const ago = daysAgo(date);
+
   try {
-    const hour = parseInt((time || '00:00').split(':')[0]);
-    const url = 'https://api.open-meteo.com/v1/history' +
+    let url, data;
+
+    if (ago <= 90) {
+      // RECENT (within 3 months): use forecast API with past_days — always up to date
+      // past_days max is 92, so this covers almost all real-world use cases
+      url = 'https://api.open-meteo.com/v1/forecast' +
+        '?latitude=' + LAT +
+        '&longitude=' + LON +
+        '&hourly=temperature_2m' +
+        '&past_days=' + Math.min(ago + 1, 92) +
+        '&forecast_days=0' +
+        '&timezone=Asia%2FKolkata';
+      const res = await fetch(url);
+      data = await res.json();
+      if (data && data.hourly && data.hourly.time) {
+        // Find the entry matching our date and hour
+        const targetTime = date + 'T' + String(hour).padStart(2,'0') + ':00';
+        const idx = data.hourly.time.indexOf(targetTime);
+        if (idx !== -1) {
+          const temp = data.hourly.temperature_2m[idx];
+          if (temp !== undefined && temp !== null) return parseFloat(temp.toFixed(1));
+        }
+      }
+    }
+
+    // OLDER (>90 days): use the archive API
+    url = 'https://archive-api.open-meteo.com/v1/archive' +
       '?latitude=' + LAT +
       '&longitude=' + LON +
       '&start_date=' + date +
       '&end_date=' + date +
       '&hourly=temperature_2m' +
       '&timezone=Asia%2FKolkata';
-    const res = await fetch(url);
-    const data = await res.json();
-    if (data && data.hourly && data.hourly.temperature_2m) {
-      // Each index = one hour (0=midnight, 5=5AM, 9=9AM, etc.)
-      const temp = data.hourly.temperature_2m[hour];
+    const res2 = await fetch(url);
+    const data2 = await res2.json();
+    if (data2 && data2.hourly && data2.hourly.temperature_2m) {
+      const temp = data2.hourly.temperature_2m[hour];
       return temp !== undefined && temp !== null ? parseFloat(temp.toFixed(1)) : null;
     }
+
   } catch(e) {
     console.warn('Historical ambient fetch failed for ' + date + ' ' + time, e);
   }
@@ -587,21 +622,53 @@ async function enrichWithHistoricalAmbient(rows) {
       continue;
     }
     try {
-      const url = 'https://api.open-meteo.com/v1/history' +
-        '?latitude=' + LAT +
-        '&longitude=' + LON +
-        '&start_date=' + date +
-        '&end_date=' + date +
-        '&hourly=temperature_2m' +
-        '&timezone=Asia%2FKolkata';
-      const res = await fetch(url);
-      const data = await res.json();
-      const hourlyTemps = (data && data.hourly && data.hourly.temperature_2m) || [];
-      byDate[date].forEach(r => {
-        const hour = parseInt((r.time || '00:00').split(':')[0]);
-        const hist = hourlyTemps[hour];
-        r.ambient = (hist !== undefined && hist !== null) ? parseFloat(hist.toFixed(1)) : null;
-      });
+      const ago = daysAgo(date);
+      let hourlyTemps = [];
+      let timeLabels = null;
+
+      if (ago <= 90) {
+        // Recent: use forecast API past_days for accuracy
+        const url = 'https://api.open-meteo.com/v1/forecast' +
+          '?latitude=' + LAT +
+          '&longitude=' + LON +
+          '&hourly=temperature_2m' +
+          '&past_days=' + Math.min(ago + 1, 92) +
+          '&forecast_days=0' +
+          '&timezone=Asia%2FKolkata';
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data && data.hourly) {
+          hourlyTemps = data.hourly.temperature_2m || [];
+          timeLabels = data.hourly.time || [];
+        }
+        byDate[date].forEach(r => {
+          const hour = parseInt((r.time || '00:00').split(':')[0]);
+          const targetTime = date + 'T' + String(hour).padStart(2,'0') + ':00';
+          const idx = timeLabels ? timeLabels.indexOf(targetTime) : -1;
+          if (idx !== -1 && hourlyTemps[idx] != null) {
+            r.ambient = parseFloat(hourlyTemps[idx].toFixed(1));
+          } else {
+            r.ambient = null;
+          }
+        });
+      } else {
+        // Older: use archive API
+        const url = 'https://archive-api.open-meteo.com/v1/archive' +
+          '?latitude=' + LAT +
+          '&longitude=' + LON +
+          '&start_date=' + date +
+          '&end_date=' + date +
+          '&hourly=temperature_2m' +
+          '&timezone=Asia%2FKolkata';
+        const res = await fetch(url);
+        const data = await res.json();
+        hourlyTemps = (data && data.hourly && data.hourly.temperature_2m) || [];
+        byDate[date].forEach(r => {
+          const hour = parseInt((r.time || '00:00').split(':')[0]);
+          const hist = hourlyTemps[hour];
+          r.ambient = (hist !== undefined && hist !== null) ? parseFloat(hist.toFixed(1)) : null;
+        });
+      }
     } catch(e) {
       console.warn('Historical fetch failed for ' + date, e);
       byDate[date].forEach(r => { if (r.ambient == null) r.ambient = null; });
