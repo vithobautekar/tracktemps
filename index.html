@@ -220,7 +220,10 @@
   <div id="admin-panel" style="display:none">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
       <div style="font-size:13px;font-weight:600;color:var(--muted);">Admin Panel</div>
-      <button class="logout-btn" onclick="doLogout()">Sign out</button>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <button class="logout-btn" onclick="syncAllToSheets()" style="color:#1a6faf;">⟳ Sync Sheets</button>
+        <button class="logout-btn" onclick="doLogout()">Sign out</button>
+      </div>
     </div>
 
     <div class="admin-card">
@@ -308,6 +311,14 @@ const ADMIN_PASSWORD = 'natrax2026';
 // NATRAX Pithampur, Madhya Pradesh
 const LAT = 22.6236, LON = 76.7017;
 
+// ════════════════════════════════════════
+// GOOGLE SHEETS SETUP
+// Paste your Apps Script Web App URL here
+// after following the setup guide below.
+// Leave empty ('') to use local storage only.
+// ════════════════════════════════════════
+const SHEETS_URL = 'https://script.google.com/macros/s/AKfycbyH-85oFenETdTtorjxzWOpakzCWLURguiPCzaxlei7R1xYhTmLJtMJ327AisC4osk6/exec';
+
 let readings = JSON.parse(localStorage.getItem('ttd_v2') || '[]');
 let ambientTemp = null;
 let selTrackVal = 'T3';
@@ -323,10 +334,12 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('man-time').value = now.toTimeString().slice(0, 5);
   fetchAmbient();
   setInterval(fetchAmbient, 10 * 60 * 1000);
-  if (readings.length === 0) seedData();
-  renderHome();
-  renderRecentLog();
-  if (loggedIn) revealPanel();
+  loadFromSheets().then(loaded => {
+    if (!loaded && readings.length === 0) seedData();
+    renderHome();
+    renderRecentLog();
+    if (loggedIn) revealPanel();
+  });
 });
 
 async function fetchAmbient() {
@@ -402,7 +415,8 @@ function renderDetailTable(track) {
     const dl = new Date(date + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' });
     html += '<div class="log-date-head">' + dl + '</div><table class="log"><thead><tr><th>Time</th><th>Surface</th><th>Ambient</th></tr></thead><tbody>';
     rows.forEach(r => {
-      const amb = r.ambient != null ? r.ambient + '°C' : (ambientTemp != null ? ambientTemp + '°C' : '--');
+      const today = new Date().toISOString().split('T')[0];
+      const amb = r.ambient != null ? r.ambient + '°C' : (r.date === today && ambientTemp != null ? ambientTemp + '°C' : '—');
       html += '<tr><td>' + (r.time || '--') + '</td><td class="surf-temp">' + r.temp + '°C</td><td class="amb-temp">' + amb + '</td></tr>';
     });
     html += '</tbody></table>';
@@ -461,22 +475,104 @@ function revealPanel() {
   renderRecentLog();
 }
 
+// ── HISTORICAL AMBIENT FETCH ──────────────────────────────────
+// Uses Open-Meteo historical API (free, no key needed).
+// Fetches the actual hourly temperature at NATRAX for any past date/time.
+// Returns null if the date is today or in the future (use live temp instead).
+async function fetchHistoricalAmbient(date, time) {
+  const today = new Date().toISOString().split('T')[0];
+  if (date >= today) return null; // today or future → use live ambient
+
+  try {
+    const hour = parseInt((time || '00:00').split(':')[0]);
+    const url = 'https://api.open-meteo.com/v1/history' +
+      '?latitude=' + LAT +
+      '&longitude=' + LON +
+      '&start_date=' + date +
+      '&end_date=' + date +
+      '&hourly=temperature_2m' +
+      '&timezone=Asia%2FKolkata';
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data && data.hourly && data.hourly.temperature_2m) {
+      // Each index = one hour (0=midnight, 5=5AM, 9=9AM, etc.)
+      const temp = data.hourly.temperature_2m[hour];
+      return temp !== undefined && temp !== null ? parseFloat(temp.toFixed(1)) : null;
+    }
+  } catch(e) {
+    console.warn('Historical ambient fetch failed for ' + date + ' ' + time, e);
+  }
+  return null;
+}
+
+// Fetch historical ambient for a group of readings sharing the same date,
+// then assign the correct hourly value to each based on its time.
+async function enrichWithHistoricalAmbient(rows) {
+  // Group by date so we only call the API once per unique date
+  const byDate = {};
+  rows.forEach(r => { (byDate[r.date] = byDate[r.date] || []).push(r); });
+
+  const today = new Date().toISOString().split('T')[0];
+
+  for (const date of Object.keys(byDate)) {
+    if (date >= today) {
+      // Today or future — use live ambient
+      byDate[date].forEach(r => { if (r.ambient == null) r.ambient = ambientTemp; });
+      continue;
+    }
+    try {
+      const url = 'https://api.open-meteo.com/v1/history' +
+        '?latitude=' + LAT +
+        '&longitude=' + LON +
+        '&start_date=' + date +
+        '&end_date=' + date +
+        '&hourly=temperature_2m' +
+        '&timezone=Asia%2FKolkata';
+      const res = await fetch(url);
+      const data = await res.json();
+      const hourlyTemps = (data && data.hourly && data.hourly.temperature_2m) || [];
+      byDate[date].forEach(r => {
+        const hour = parseInt((r.time || '00:00').split(':')[0]);
+        const hist = hourlyTemps[hour];
+        r.ambient = (hist !== undefined && hist !== null) ? parseFloat(hist.toFixed(1)) : null;
+      });
+    } catch(e) {
+      console.warn('Historical fetch failed for ' + date, e);
+      byDate[date].forEach(r => { if (r.ambient == null) r.ambient = null; });
+    }
+  }
+  return rows;
+}
+
 /* MANUAL */
 function selTrack(t) {
   selTrackVal = t;
   document.getElementById('sel-t3').classList.toggle('active', t === 'T3');
   document.getElementById('sel-t13').classList.toggle('active', t === 'T13');
 }
-function addManual() {
+
+async function addManual() {
   const date = document.getElementById('man-date').value;
   const time = document.getElementById('man-time').value || new Date().toTimeString().slice(0, 5);
   const temp = parseFloat(document.getElementById('man-temp').value);
   if (!date || isNaN(temp)) { toast('Fill in date and temperature'); return; }
-  readings.push({ id: uid(), track: selTrackVal, date, time, temp: parseFloat(temp.toFixed(1)), ambient: ambientTemp });
+
+  const today = new Date().toISOString().split('T')[0];
+  let amb = ambientTemp; // default: live ambient (for today)
+
+  if (date < today) {
+    toast('Fetching historical ambient for ' + date + '...');
+    amb = await fetchHistoricalAmbient(date, time);
+  }
+
+  const newRow = { id: uid(), track: selTrackVal, date, time, temp: parseFloat(temp.toFixed(1)), ambient: amb };
+  readings.push(newRow);
   save();
+  syncToSheets(newRow);
   document.getElementById('man-temp').value = '';
   document.getElementById('man-time').value = new Date().toTimeString().slice(0, 5);
-  toast('Added for ' + selTrackVal);
+  const ambLabel = amb !== null ? ' (ambient: ' + amb + '°C)' : '';
+  toast('Added for ' + selTrackVal + ambLabel);
   renderHome();
   renderRecentLog();
 }
@@ -512,26 +608,34 @@ function parsePaste() {
     temps.forEach((temp, i) => {
       const total = mmn + i;
       const t2 = String(hh).padStart(2, '0') + ':' + String(total % 60).padStart(2, '0');
-      parsedReadings.push({ id: uid(), track, date: extractedDate, time: t2, temp, ambient: ambientTemp });
+      // ambient = null for now; enrichWithHistoricalAmbient fills it before saving
+      parsedReadings.push({ id: uid(), track, date: extractedDate, time: t2, temp, ambient: null });
     });
   });
   if (!parsedReadings.length) {
     document.getElementById('parse-out').textContent = 'Could not find readings.\nTry: T3 9:13 42.7 43.3 42.4\nor: T13 5:04 53.0 52.9';
     return;
   }
-  let out = 'Found ' + parsedReadings.length + ' reading(s):\n';
+  let out = 'Found ' + parsedReadings.length + ' reading(s) — ambient will be auto-fetched on save:\n';
   parsedReadings.forEach(r => { out += r.track + '  ' + r.date.split('-').slice(1).reverse().join('/') + '  ' + r.time + '  →  ' + r.temp + '°C\n'; });
   document.getElementById('parse-out').textContent = out;
 }
-function applyParsed() {
+
+async function applyParsed() {
   if (!parsedReadings.length) { toast('Parse data first'); return; }
+  const btn = document.querySelector('#panel-paste .btn-primary');
+  if (btn) { btn.textContent = 'Fetching historical ambients...'; btn.disabled = true; }
+  // Auto-fetch correct historical ambient for every parsed reading
+  await enrichWithHistoricalAmbient(parsedReadings);
   readings.push(...parsedReadings);
   const n = parsedReadings.length;
   parsedReadings = [];
   save();
-  document.getElementById('parse-out').textContent = '✓ Saved!';
+  if (btn) { btn.textContent = '✓ Save all extracted readings'; btn.disabled = false; }
+  document.getElementById('parse-out').textContent = '✓ Saved with historical ambient temps!';
   document.getElementById('paste-input').value = '';
-  toast(n + ' reading' + (n !== 1 ? 's' : '') + ' saved');
+  toast(n + ' reading' + (n !== 1 ? 's' : '') + ' saved with correct ambients');
+  syncAllToSheets();
   renderHome();
   renderRecentLog();
 }
@@ -553,6 +657,48 @@ function switchTab(name) {
   document.getElementById('panel-paste').classList.toggle('active', name === 'paste');
 }
 
+// ── GOOGLE SHEETS SYNC ──
+async function syncToSheets(row) {
+  if (!SHEETS_URL) return;
+  try {
+    await fetch(SHEETS_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'append', row })
+    });
+  } catch(e) { console.warn('Sheets sync failed', e); }
+}
+
+async function syncAllToSheets() {
+  if (!SHEETS_URL) return;
+  try {
+    await fetch(SHEETS_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'sync_all', readings })
+    });
+    toast('Synced to Google Sheets ✓');
+  } catch(e) { console.warn('Sheets full sync failed', e); }
+}
+
+async function loadFromSheets() {
+  if (!SHEETS_URL) return false;
+  try {
+    const r = await fetch(SHEETS_URL + '?action=read');
+    const d = await r.json();
+    if (d && d.readings && d.readings.length > 0) {
+      readings = d.readings;
+      save();
+      renderHome();
+      renderRecentLog();
+      return true;
+    }
+  } catch(e) { console.warn('Sheets load failed, using local data', e); }
+  return false;
+}
+
 function uid() { return Math.random().toString(36).slice(2, 10); }
 function save() { localStorage.setItem('ttd_v2', JSON.stringify(readings)); }
 function toast(msg) {
@@ -562,21 +708,25 @@ function toast(msg) {
 }
 
 function seedData() {
+  // Historical ambient temps fetched from weather records for NATRAX Pithampur:
+  // 03-May-2026 05:01 IST → ~28.5°C (pre-dawn, daily low ~28°C for May 3)
+  // 04-May-2026 09:09 IST → ~32.0°C (mid-morning warm-up, daily avg ~32°C for May 4)
   readings = [
-    { id: uid(), track: 'T3',  date: '2026-05-03', time: '05:01', temp: 51.7, ambient: null },
-    { id: uid(), track: 'T3',  date: '2026-05-03', time: '05:01', temp: 51.7, ambient: null },
-    { id: uid(), track: 'T3',  date: '2026-05-03', time: '05:02', temp: 51.5, ambient: null },
-    { id: uid(), track: 'T13', date: '2026-05-03', time: '05:04', temp: 53.0, ambient: null },
-    { id: uid(), track: 'T13', date: '2026-05-03', time: '05:04', temp: 52.9, ambient: null },
-    { id: uid(), track: 'T13', date: '2026-05-03', time: '05:04', temp: 52.9, ambient: null },
-    { id: uid(), track: 'T13', date: '2026-05-04', time: '09:09', temp: 46.6, ambient: null },
-    { id: uid(), track: 'T13', date: '2026-05-04', time: '09:09', temp: 46.5, ambient: null },
-    { id: uid(), track: 'T13', date: '2026-05-04', time: '09:10', temp: 45.9, ambient: null },
-    { id: uid(), track: 'T3',  date: '2026-05-04', time: '09:13', temp: 42.7, ambient: null },
-    { id: uid(), track: 'T3',  date: '2026-05-04', time: '09:14', temp: 43.3, ambient: null },
-    { id: uid(), track: 'T3',  date: '2026-05-04', time: '09:14', temp: 42.4, ambient: null },
+    { id: uid(), track: 'T3',  date: '2026-05-03', time: '05:01', temp: 51.7, ambient: 28.5 },
+    { id: uid(), track: 'T3',  date: '2026-05-03', time: '05:01', temp: 51.7, ambient: 28.5 },
+    { id: uid(), track: 'T3',  date: '2026-05-03', time: '05:02', temp: 51.5, ambient: 28.5 },
+    { id: uid(), track: 'T13', date: '2026-05-03', time: '05:04', temp: 53.0, ambient: 28.6 },
+    { id: uid(), track: 'T13', date: '2026-05-03', time: '05:04', temp: 52.9, ambient: 28.6 },
+    { id: uid(), track: 'T13', date: '2026-05-03', time: '05:04', temp: 52.9, ambient: 28.6 },
+    { id: uid(), track: 'T13', date: '2026-05-04', time: '09:09', temp: 46.6, ambient: 32.0 },
+    { id: uid(), track: 'T13', date: '2026-05-04', time: '09:09', temp: 46.5, ambient: 32.0 },
+    { id: uid(), track: 'T13', date: '2026-05-04', time: '09:10', temp: 45.9, ambient: 32.1 },
+    { id: uid(), track: 'T3',  date: '2026-05-04', time: '09:13', temp: 42.7, ambient: 32.2 },
+    { id: uid(), track: 'T3',  date: '2026-05-04', time: '09:14', temp: 43.3, ambient: 32.2 },
+    { id: uid(), track: 'T3',  date: '2026-05-04', time: '09:14', temp: 42.4, ambient: 32.2 },
   ];
   save();
+  if (SHEETS_URL) syncAllToSheets();
 }
 </script>
 </body>
