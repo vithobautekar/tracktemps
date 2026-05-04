@@ -578,6 +578,77 @@ function seedData() {
   ];
   save();
 }
+  // Add this to your index.html in the <script> section, right before the closing </script> tag
+// Then run it once, and you can delete it after
+
+// ════════════════════════════════════════
+// MIGRATION: Fix Historical Ambient Temps
+// ════════════════════════════════════════
+
+async function migrateHistoricalAmbientTemps() {
+  console.log('🔄 Starting historical data migration...');
+  
+  const LAT = 22.6236, LON = 76.7017;
+  let readings = JSON.parse(localStorage.getItem('ttd_v2') || '[]');
+  let updatedCount = 0;
+  let failedCount = 0;
+
+  // Helper function to fetch historical ambient temp
+  async function fetchHistoricalAmbient(date, time) {
+    try {
+      const [hh, mm] = time.split(':').map(Number);
+      const hourStr = String(hh).padStart(2, '0') + ':00';
+      const apiUrl = `https://archive-api.open-meteo.com/v1/archive?latitude=${LAT}&longitude=${LON}&date=${date}&start_date=${date}&end_date=${date}&hourly=temperature_2m&temperature_unit=celsius&timezone=Asia/Kolkata`;
+      
+      const r = await fetch(apiUrl);
+      const d = await r.json();
+      
+      if (d.hourly && d.hourly.time && d.hourly.temperature_2m) {
+        const idx = d.hourly.time.indexOf(date + 'T' + hourStr);
+        if (idx >= 0) {
+          return parseFloat(d.hourly.temperature_2m[idx].toFixed(1));
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to fetch ambient for', date, time, e);
+    }
+    return null;
+  }
+
+  // Process each reading
+  for (let i = 0; i < readings.length; i++) {
+    const r = readings[i];
+    
+    // Only update if ambient is null or seems incorrect
+    if (r.ambient === null || r.ambient === undefined) {
+      const ambientVal = await fetchHistoricalAmbient(r.date, r.time);
+      if (ambientVal !== null) {
+        r.ambient = ambientVal;
+        updatedCount++;
+        console.log(`✓ Updated ${r.track} ${r.date} ${r.time}: ambient = ${ambientVal}°C`);
+      } else {
+        failedCount++;
+        console.log(`✗ Failed to fetch ${r.track} ${r.date} ${r.time}`);
+      }
+    }
+    
+    // Add small delay to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
+  // Save updated data
+  localStorage.setItem('ttd_v2', JSON.stringify(readings));
+  console.log(`\n✅ Migration complete!\n${updatedCount} records updated\n${failedCount} records failed`);
+  console.log('Refreshing page...');
+  
+  // Refresh the page to show updated data
+  window.location.reload();
+}
+
+// Run migration if user confirms
+if (confirm('⚠️ This will update all historical records with correct ambient temperatures.\n\nThis may take a few minutes. Continue?')) {
+  migrateHistoricalAmbientTemps();
+}
 </script>
 </body>
 </html>
