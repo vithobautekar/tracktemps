@@ -358,6 +358,37 @@ function normalizeTimeForTesting(timeStr) {
   return String(hour).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
 }
 
+// ── HISTORICAL DATA MIGRATION ──
+// One-time migration to normalize all stored times and fetch correct historical ambients
+async function migrateHistoricalAmbient() {
+  const migrationVersion = 'v1_ambient_normalization';
+  const alreadyMigrated = sessionStorage.getItem('ttd_migration_' + migrationVersion);
+  
+  if (alreadyMigrated) return; // Already done in this session
+  
+  if (readings.length === 0) {
+    sessionStorage.setItem('ttd_migration_' + migrationVersion, '1');
+    return;
+  }
+
+  toast('Updating historical ambient temperatures...');
+  
+  // Normalize times and mark for ambient fetch
+  const normalizedReadings = readings.map(r => {
+    r.time = normalizeTimeForTesting(r.time || '00:00');
+    return r;
+  });
+  
+  // Fetch historical ambients for all past dates
+  await enrichWithHistoricalAmbient(normalizedReadings);
+  
+  readings = normalizedReadings;
+  save();
+  
+  sessionStorage.setItem('ttd_migration_' + migrationVersion, '1');
+  toast('✓ Historical data updated with correct ambient temps');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const now = new Date();
   const today = now.toISOString().split('T')[0];
@@ -368,9 +399,11 @@ document.addEventListener('DOMContentLoaded', () => {
   setInterval(fetchAmbient, 10 * 60 * 1000);
   loadFromSheets().then(loaded => {
     if (!loaded && readings.length === 0) seedData();
-    renderHome();
-    renderRecentLog();
-    if (loggedIn) revealPanel();
+    migrateHistoricalAmbient().then(() => {
+      renderHome();
+      renderRecentLog();
+      if (loggedIn) revealPanel();
+    });
   });
 });
 
